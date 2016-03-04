@@ -15,7 +15,7 @@
 # under the License.
 """Tests for libvirt inspector.
 """
-
+import commands
 try:
     import contextlib2 as contextlib   # for Python < 3.3
 except ImportError:
@@ -179,6 +179,64 @@ class TestLibvirtInspection(base.BaseTestCase):
             self.assertEqual(11, info2.tx_bytes)
             self.assertEqual(12, info2.tx_packets)
 
+    def test_inspect_vnics_with_sriov(self):
+        dom_xml = """
+             <domain type='kvm'>
+                 <devices>
+                    <!-- NOTE(dprince): interface with no target -->
+                    <interface type='hostdev' managed='yes'>
+                      <mac address='fa:16:3e:a2:82:2d'/>
+                      <driver name='kvm'/>
+                      <source>
+                        <address type='pci' domain='0x0000' bus='0x84' \
+                          slot='0x1f' function='0x5'/>
+                      </source>
+                      <vlan>
+                        <tag id='1'/>
+                      </vlan>
+                      <alias name='hostdev0'/>
+                      <address type='pci' domain='0x0000' bus='0x00' \
+                        slot='0x04' function='0x0'/>
+                    </interface>
+                 </devices>
+             </domain>
+        """
+
+        output = iter((
+            """5: enp132s0f1: <BROADCAST,MULTICAST,PROMISC,UP,LOWER_UP> mtu \
+               9000 qdisc mq master ovs-system state UP mode DEFAULT qlen 1000
+             vf 62 MAC fa:16:3e:a2:82:2d, vlan 160, link-state auto""",
+            """VF 62 Rx Packets: 8
+             VF 62 Rx Bytes: 680
+             VF 62 Tx Packets: 22
+             VF 62 Tx Bytes: 4110
+             VF 62 MC Packets: 12"""
+            ))
+
+        connection = self.inspector.connection
+        with contextlib.nested(mock.patch.object(connection,
+                                                 'lookupByUUIDString',
+                                                 return_value=self.domain),
+                               mock.patch.object(self.domain, 'XMLDesc',
+                                                 return_value=dom_xml),
+                               mock.patch.object(commands, 'getoutput',
+                                                 side_effect=output),
+                               mock.patch.object(self.domain, 'info',
+                                                 return_value=(0L, 0L, 0L,
+                                                               2L, 999999L))):
+
+            interfaces = list(self.inspector.inspect_vnics(self.instance))
+
+            self.assertEqual(1, len(interfaces))
+            vnic0, info0 = interfaces[0]
+            self.assertEqual('enp132s0f1-vf62', vnic0.name)
+            self.assertEqual('fa:16:3e:a2:82:2d', vnic0.mac)
+            self.assertEqual(None, vnic0.fref)
+            self.assertEqual(None, vnic0.parameters)
+            self.assertEqual(680, info0.rx_bytes)
+            self.assertEqual(8, info0.rx_packets)
+            self.assertEqual(4110, info0.tx_bytes)
+            self.assertEqual(22, info0.tx_packets)
     def test_inspect_vnics_with_domain_shutoff(self):
         connection = self.inspector.connection
         with contextlib.ExitStack() as stack:

@@ -14,6 +14,10 @@
 # under the License.
 """Implementation of Inspector abstraction for libvirt."""
 
+import re
+import os
+import commands
+
 from lxml import etree
 from oslo_config import cfg
 from oslo_log import log as logging
@@ -130,33 +134,94 @@ class LibvirtInspector(virt_inspector.Inspector):
 
     def inspect_vnics(self, instance):
         domain = self._get_domain_not_shut_off_or_raise(instance)
-
+        mac_cache = []
         tree = etree.fromstring(domain.XMLDesc(0))
         for iface in tree.findall('devices/interface'):
-            target = iface.find('target')
-            if target is not None:
-                name = target.get('dev')
-            else:
-                continue
             mac = iface.find('mac')
             if mac is not None:
                 mac_address = mac.get('address')
             else:
                 continue
-            fref = iface.find('filterref')
-            if fref is not None:
-                fref = fref.get('filter')
 
-            params = dict((p.get('name').lower(), p.get('value'))
-                          for p in iface.findall('filterref/parameter'))
-            interface = virt_inspector.Interface(name=name, mac=mac_address,
-                                                 fref=fref, parameters=params)
-            dom_stats = domain.interfaceStats(name)
-            stats = virt_inspector.InterfaceStats(rx_bytes=dom_stats[0],
-                                                  rx_packets=dom_stats[1],
-                                                  tx_bytes=dom_stats[4],
-                                                  tx_packets=dom_stats[5])
-            yield (interface, stats)
+            if iface.get('type') == "hostdev":
+                if mac_address not in mac_cache:
+                    mac_cache.append(mac_address)
+                else:
+                    continue
+                srivo_infos = self.inspect_vnics_sriov(mac_address)
+                for sriov in srivo_infos:
+                    sriov_name = sriov.get("if_name") + '-vf' \
+                        + str(sriov.get("vf_num"))
+                    interface = virt_inspector.Interface(
+                        name=sriov_name,
+                        mac=mac_address,
+                        fref=None,
+                        parameters=None)
+                    stats = virt_inspector.InterfaceStats(
+                        rx_bytes=sriov.get("rx_bytes"),
+                        rx_packets=sriov.get("rx_packets"),
+                        tx_bytes=sriov.get("tx_bytes"),
+                        tx_packets=sriov.get("tx_packets"))
+                    yield (interface, stats)
+            else:
+                target = iface.find('target')
+                if target is not None:
+                    name = target.get('dev')
+                else:
+                    continue
+                fref = iface.find('filterref')
+                if fref is not None:
+                    fref = fref.get('filter')
+                params = dict((p.get('name').lower(), p.get('value'))
+                              for p in iface.findall('filterref/parameter'))
+
+                interface = virt_inspector.Interface(name=name,
+                                                     mac=mac_address,
+                                                     fref=fref,
+                                                     parameters=params)
+                dom_stats = domain.interfaceStats(name)
+                stats = virt_inspector.InterfaceStats(rx_bytes=dom_stats[0],
+                                                      rx_packets=dom_stats[1],
+                                                      tx_bytes=dom_stats[4],
+                                                      tx_packets=dom_stats[5])
+                yield (interface, stats)
+
+    def inspect_vnics_sriov(self, mac_address):
+        sriov_infos = []
+        regex_get_string = re.compile("\W+")
+        regex_get_number = re.compile("\d+")
+
+        output = commands.getoutput("ip link show")
+        for if_info in re.split(r'\n(?=\d)', output):
+            if_name = vf_num = None
+            for line in if_info.split(os.linesep):
+                if regex_get_number.match(line):
+                    if_name = regex_get_string.split(line)[1].strip()
+                if mac_address in line:
+                    vf_num = int(regex_get_number.search(line).group())
+            if if_name is not None and vf_num is not None:
+                sriov_state = self.get_sriov_state(if_name, vf_num)
+                sriov_infos.append(sriov_state)
+
+        return sriov_infos
+
+    def get_sriov_state(self, if_name, vf_num):
+        sriov_state = {}
+        sriov_state["if_name"] = if_name
+        sriov_state["vf_num"] = vf_num
+        output = commands.getoutput("ethtool -S %s | grep 'VF %s'"
+                                    % (if_name, vf_num))
+        for line in output.split(os.linesep):
+            counter, value = line.strip().split(':')
+            if 'Rx Bytes' in counter:
+                sriov_state["rx_bytes"] = int(value)
+            if 'Rx Packets' in counter:
+                sriov_state["rx_packets"] = int(value)
+            if 'Tx Bytes' in counter:
+                sriov_state["tx_bytes"] = int(value)
+            if 'Tx Packets' in counter:
+                sriov_state["tx_packets"] = int(value)
+        return sriov_state
 
     def inspect_disks(self, instance):
         domain = self._get_domain_not_shut_off_or_raise(instance)
